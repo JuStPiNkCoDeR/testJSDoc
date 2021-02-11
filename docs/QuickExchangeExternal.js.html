@@ -34,69 +34,88 @@ const { EUR: EXCHANGE_LIMIT_EUR } = sails.config.exchangeLimit
 const { parsingHours } = sails.config.quickExchange.external
 
 /**
- * @typedef {import('./Transaction.js').Transaction} Transaction
+ * @typedef {import('./Transaction').Transaction} Transaction
  */
 /**
- * @typedef {{
- *     id?: number,
- *     generatedWalletId?: string,
- *     userId?: string,
- *     requestId?: string,
- *     userType?: 'UNREGISTERED' | 'REGISTERED',
- *     admissionAddress?: string,
- *     status?: string,
- *     receivedTxId?: string,
- * }} SearchCase
+ * @typedef {'REGISTERED' | 'UNREGISTERED'} UserType
  */
 /**
- * @typedef {{ limit: number, sort: string, page: number }} PaginationParams
+ * @typedef {'Success' | 'Awaiting' | 'Failed' | 'Closed' | 'Expired' | 'Received' | 'Paying'} ExchangeStatus
  */
 /**
- * @typedef {{ amount: string?, walletId?: string, currencyId?: string, walletName: string? }} NotificationData
+ * @typedef {'ASC' | 'DESC'} SortDirection
  */
 /**
- * @typedef {{
- *     toReceive: string,
- *     toPay: string,
- *     profit: string,
- *     fees: {
- *         out: string,
- *         in: string,
- *         convertedOut: string,
- *     },
- *     rate: string,
- *     currencies: { receive: string, pay: string, },
- *     balance: boolean,
- *     availableAmount?: string,
- * }} PaymentInfo
+ * @typedef {Object} SearchCase
+ * @property {number} [id] - The ID of an exchange.
+ * @property {string} [generatedWalletId] - The wallet ID of a service wallet where user should send funds.
+ * @property {string} [userId] - The user ID who created an exchange.
+ * @property {string} [requestId] - The small rememberable string that identify an exchange.
+ * @property {UserType} [userType] - The type of an user.
+ * @property {string} [admissionAddress] - The address or wallet ID where the service should send funds.
+ * @property {ExchangeStatus} [status] - The exchange status.
+ * @property {string} [receivedTxId] - The ID of a transaction which the service received from an user.
  */
 /**
- * @typedef {{
- *  paymentInfo: PaymentInfo,
- *  admissionAddress: string
- * }} ExchangeInput
+ * @typedef {Object} PaginationParams
+ * @property {number} limit - The amount of maximum fetched entities.
+ * @property {SortDirection} sort - The direction of sorting.
+ * @property {number} page - The amount to skip.
  */
 /**
- * @typedef {{
- *     id: number,
- *     requestId: string,
- *     userType?: 'REGISTERED' | 'UNREGISTERED',
- *     generatedWalletId: string,
- *     admissionAddress: string,
- *     status: 'Success' | 'Awaiting' | 'Failed' | 'Closed' | 'Expired' | 'Received' | 'Paying',
- *     receiveTx: number | Transaction,
- *     payTx: number | Transaction,
- *     paymentInfo: PaymentInfo,
- *     beginHandleTime?: Date,
- *     failReason?: string,
- *     fillRequest: function(amount: string, dbTrx: *): Promise&lt;void>,
- *     payToUser: function(*): Promise&lt;*>,
- *     notifyUser: function(userId: string, eventName: string, data: NotificationData): Promise&lt;void>,
- *     transferToServiceWallet: function(*): Promise&lt;*>,
- *     makeReverseOrderAtBinance: function(): Promise&lt;void>
- * }} QuickExchangeRequest
+ * @typedef {Object} NotificationData
+ * @property {string} [amount] - The amount that used in specific action.
+ * @property {string} [walletId] - The ID of a wallet on which an action occurred.
+ * @property {string} [currencyId] - The ID of a currency which used in action.
+ * @property {string} [walletName] - The name of a wallet on which an action occurred.
  */
-
+/**
+ * @typedef {Object} FeeInfo
+ * @property {string} out - The fee of paying to an user.
+ * @property {string} in - The fee of paying from an user to us.
+ * @property {string} convertedOut - The out fee converted in paying to an user currency.
+ * @property {string} convertedIn - The in fee converted in paying to an user currency.
+ */
+/**
+ * @typedef {Object} CurrencyInfo
+ * @property {string} pay - The currency to pat to an user.
+ * @property {string} receive - The currency to receive from an user.
+ */
+/**
+ * @typedef {Object} PaymentInfo
+ * @property {string} toReceive - The amount of funds to receive from an user.
+ * @property {string} toPay - The amount of funds to pay to an user.
+ * @property {FeeInfo} fees - The information about fees.
+ * @property {string} rate - The rate at the creation moment.
+ * @property {CurrencyInfo} currencies - The information about currencies.
+ * @property {boolean} balance - It's true if the service has enough funds to pay to an user.
+ * @property {string} [availableAmount] - The amount of funds at the service.
+ */
+/**
+ * @typedef {Object} ExchangeInput
+ * @property {PaymentInfo} paymentInfo - The structure contains information about payments.
+ * @property {string} admissionAddress - The address or wallet ID where the service should send funds.
+ */
+/**
+ * @typedef {Object} QuickExchangeRequest
+ * @property {number} id - The ID of a request.
+ * @property {string} requestId - The small rememberable string that also identify a request.
+ * @property {UserType} [userType] - The type of a user who created an exchange,
+ * @property {string} generatedWalletId - The ID of a temporary service wallet where user should send crypto.
+ * @property {string} admissionAddress - The address or wallet ID where the service should send crypto.
+ * @property {ExchangeStatus} status - The status of a exchange.
+ * @property {number | Transaction} [receiveTx] - The ID of received transaction or the transaction entity itself.
+ * @property {number | Transaction} [payTx] - The ID of payed transaction of the transaction entity itself.
+ * @property {PaymentInfo} paymentInfo - The structure containing payment information.
+ * @property {Date} [beginHandleTime] - The date when the service started to parsing incoming transactions for an exchange.
+ * @property {string} [failReason] - The text description of an error if it occurred.
+ * @property {string} [userId] - The user ID who created an exchange.
+ * @property {function(amount: string, dbTrx: *): Promise&lt;void>} fillRequest - The method to complete an exchange.
+ * @property {function(*): Promise&lt;*>} payToUser - The method to pay to an user.
+ * @property {function(userId: string, eventName: string, data: NotificationData): Promise&lt;void>} notifyUser - The method to sent notification to an user.
+ * @property {function(*): Promise&lt;*>} transferToServiceWallet - The method to proceed transfer between service wallets.
+ * @property {function(): Promise&lt;void>} makeReverseOrderAtBinance - The method to proceed mirror order on the Binance.
+ */
 /**
  * @typedef {Object} EstimateFixedParams
  * @property {string} feeIn - fee for incoming to the service transaction.
@@ -136,11 +155,9 @@ async function updateServiceBalance(walletId, balanceToUpdate, dbTrx) {
 }
 
 /**
- * QuickExchangeExternal.js
- *
- * @description :: QuickExchangeExternal shows quick exchanges with external sources or destinations
- * @docs        :: http://sailsjs.org/documentation/concepts/models-and-orm/models
  * @module QuickExchangeExternal
+ * @description QuickExchangeExternal shows quick exchanges with external sources or destinations
+ * @see http://sailsjs.org/documentation/concepts/models-and-orm/models
  */
 /*
     Flow:
@@ -569,7 +586,7 @@ module.exports = {
     },
 
     /**
-     * @description Creates a new CWE user and service wallet for the user
+     * @description Creates a new CGW user and service wallet for the user
      * @param {ExchangeInput} exchangeData
      * @param {*} dbTrx - Database transaction
      * @param {string?} userId
@@ -1209,7 +1226,7 @@ module.exports = {
 <br class="clear">
 
 <footer>
-    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.6</a> on Thu Feb 11 2021 16:46:58 GMT+0600 (+06)
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.6</a> on Thu Feb 11 2021 20:35:13 GMT+0600 (+06)
 </footer>
 
 <script> prettyPrint(); </script>
