@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: QuickExchangeExternal.js</title>
+
+    <script src='scripts/prettify/prettify.js'> </script>
+    <script src='scripts/prettify/lang-css.js'> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href='styles/prettify-tomorrow.css'>
+    <link type="text/css" rel="stylesheet" href='styles/jsdoc-default.css'>
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: QuickExchangeExternal.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const { sum, sub, div, mul, gt, eq, lte, lt } = require('../services/PreciseCalculationsService')
+const Logger = require('../services/Logger')
+const { mkErr } = require('../services/ErrorGeneratorService')
+const EXCHANGE_SERVICE_USERID = sails.config.serviceAccounts.exchangeUserId
+const { EUR: EXCHANGE_LIMIT_EUR } = sails.config.exchangeLimit
+const { parsingHours } = sails.config.quickExchange.external
+
+/**
+ * @typedef {import('./Transaction.js').Transaction} Transaction
+ */
+/**
+ * @typedef {{
+ *     id?: number,
+ *     generatedWalletId?: string,
+ *     userId?: string,
+ *     requestId?: string,
+ *     userType?: 'UNREGISTERED' | 'REGISTERED',
+ *     admissionAddress?: string,
+ *     status?: string,
+ *     receivedTxId?: string,
+ * }} SearchCase
+ */
+/**
+ * @typedef {{ limit: number, sort: string, page: number }} PaginationParams
+ */
+/**
+ * @typedef {{ amount: string?, walletId?: string, currencyId?: string, walletName: string? }} NotificationData
+ */
+/**
+ * @typedef {{
+ *     toReceive: string,
+ *     toPay: string,
+ *     profit: string,
+ *     fees: {
+ *         out: string,
+ *         in: string,
+ *         convertedOut: string,
+ *     },
+ *     rate: string,
+ *     currencies: { receive: string, pay: string, },
+ *     balance: boolean,
+ *     availableAmount?: string,
+ * }} PaymentInfo
+ */
+/**
+ * @typedef {{
+ *  paymentInfo: PaymentInfo,
+ *  admissionAddress: string
+ * }} ExchangeInput
+ */
+/**
+ * @typedef {{
+ *     id: number,
+ *     requestId: string,
+ *     userType?: 'REGISTERED' | 'UNREGISTERED',
+ *     generatedWalletId: string,
+ *     admissionAddress: string,
+ *     status: 'Success' | 'Awaiting' | 'Failed' | 'Closed' | 'Expired' | 'Received' | 'Paying',
+ *     receiveTx: number | Transaction,
+ *     payTx: number | Transaction,
+ *     paymentInfo: PaymentInfo,
+ *     beginHandleTime?: Date,
+ *     failReason?: string,
+ *     fillRequest: function(amount: string, dbTrx: *): Promise&lt;void>,
+ *     payToUser: function(*): Promise&lt;*>,
+ *     notifyUser: function(userId: string, eventName: string, data: NotificationData): Promise&lt;void>,
+ *     transferToServiceWallet: function(*): Promise&lt;*>,
+ *     makeReverseOrderAtBinance: function(): Promise&lt;void>
+ * }} QuickExchangeRequest
+ */
+
+/**
+ * @typedef {Object} EstimateFixedParams
+ * @property {string} feeIn - fee for incoming to the service transaction.
+ * @property {string} feeOut - fee for outgoing to the user transaction.
+ */
+
+/**
+ * @description Creates a request ID for communication between user and admin
+ * @return {string}
+ */
+function generateRequestId() {
+    const [min, max] = [100000, 1000000]
+    return `${Math.floor(Math.random() * (max - min) + min)}`
+}
+
+/**
+ * @description Returns a string that applies as date for database
+ * @param {Date} date
+ */
+function toDatabaseDateString(date) {
+    return date
+        .toISOString()
+        .replace('T', ' ')
+        .split('.')[0]
+}
+
+/**
+ * @description Provides more concrete balance updating.
+ * @param {string} walletId - The GUID of service wallet.
+ * @param {{ held_balance: string }} balanceToUpdate - The balance map to update.
+ * @param {*} dbTrx - The database transaction
+ * @return {Promise&lt;void>}
+ */
+async function updateServiceBalance(walletId, balanceToUpdate, dbTrx) {
+    const wallet = await Wallet.knexFindOne(walletId, dbTrx)
+    return wallet.updateBalances(balanceToUpdate, dbTrx)
+}
+
+/**
+ * QuickExchangeExternal.js
+ *
+ * @description :: QuickExchangeExternal shows quick exchanges with external sources or destinations
+ * @docs        :: http://sailsjs.org/documentation/concepts/models-and-orm/models
+ *
+ * Flow:
+ *  a) user creates an exchange request(generates user's service wallet if its required)
+ *  b) user sends crypto to the generated wallet address
+ *  c) service sends crypto to the admission address(or neuronEx wallet ID)
+ *  d) transfers from generated wallet to the general service wallet
+ *  e) creates a Binance mirror order
+ */
+module.exports = {
+    tableName: 'quickExchangeExternal',
+    attributes: {
+        id: { type: 'integer', autoIncrement: true, unique: true, primaryKey: true },
+        requestId: { type: 'string', required: true }, // Numerical ID that easy rememberable for users
+        userType: { type: 'string', enum: ['REGISTERED', 'UNREGISTERED'], required: true },
+        generatedWalletId: { type: 'string', required: true },
+        admissionAddress: { type: 'string', required: true }, // The address where to send exchanged crypto
+        status: {
+            type: 'string',
+            enum: ['Success', 'Awaiting', 'Failed', 'Expired', 'Received', 'Paying', 'Payed', 'Closing'],
+            defaultsTo: 'Awaiting',
+        },
+        receiveTx: { model: 'transaction', columnName: 'receiveTxId' }, // Contains the Transaction ID that shows tx info from user to us
+        payTx: { model: 'transaction', columnName: 'payTxId' }, // Contains the Transaction ID that shows tx info from us to user
+        /**
+         * @see PaymentInfo
+         */
+        paymentInfo: { type: 'json', required: true }, // Contains the whole information about user payment &amp; our payment &amp; fees
+        beginHandleTime: { type: 'datetime' }, // The ISO time when we init our handle incoming transactions process
+        failReason: { type: 'string' }, // Contains an description of the exchange request failure
+        userId: { type: 'string' },
+
+        /**
+         * @description send notification
+         * @param {string} userId
+         * @param {string} eventName
+         * @param {NotificationData} data
+         * @return {Promise&lt;void>}
+         */
+        async notifyUser(userId, eventName, data) {
+            const notification = {
+                userId,
+                eventName,
+                payload: {
+                    ...data,
+                    exchangeId: this.requestId,
+                },
+            }
+            return UserNotification.createAndDeliver(notification)
+        },
+
+        /**
+         * @description Pays to the user
+         * @this {QuickExchangeRequest}
+         * @param {string} amount - Amount that user send to us
+         * @param {*} dbTrx - Database transaction
+         * @return {Promise&lt;*>}
+         */
+        async payToUser(amount, dbTrx) {
+            const ctx = 'QuickExchangeExternal::payToUser'
+            Logger.log('debug', `Paying to user due to the request: ${this.id}`, ctx)
+            const {
+                currencies: { pay, receive },
+                toPay,
+                toReceive,
+                fees: { out },
+            } = this.paymentInfo
+            /**
+             * @param {{ currency: string, amount: string, fee: string, dst: string, destinationTag?: string, holdDiff?: string }} data
+             */
+            const createPayTransaction = async data => {
+                const { currency, amount, fee, dst, destinationTag, holdDiff } = data
+                const [srcWallet] = await Wallet.knexSelectForUpdate(
+                    {
+                        user_id: EXCHANGE_SERVICE_USERID,
+                        crypto_currency: currency,
+                    },
+                    dbTrx,
+                )
+                if (!srcWallet) {
+                    throw mkErr.notFound('Source wallet not found for paying to user')
+                }
+                const txInput = {
+                    type: 'External',
+                    amount,
+                    fee,
+                    src: srcWallet.id,
+                    dst,
+                    additional_data: {
+                        relatedModelId: this.id,
+                        relatedModelName: 'quickExchangeExternal',
+                        whoIsSending: 'service',
+                    },
+                }
+                if (destinationTag) {
+                    txInput.additional_data.destinationTag = destinationTag
+                }
+                Logger.log('debug', `Pay to user transaction: ${JSON.stringify(txInput)}`, ctx)
+                /**
+                 * @type {Transaction}
+                 */
+                const tx = await Transaction.insertOutTx(txInput, dbTrx)
+                holdDiff &amp;&amp; (await srcWallet.updateBalances({ held_balance: `+${holdDiff}` }, dbTrx))
+                await QuickExchangeExternal.update({ id: this.id }, { status: 'Paying', payTx: tx.id })
+                return tx
+            }
+            if (eq(amount, toReceive)) {
+                return createPayTransaction({ currency: pay, amount: toPay, fee: out, dst: this.admissionAddress })
+            }
+            Logger.log('debug', `Received amount is not equal to ${toReceive}. Received: ${amount}`, ctx)
+            /**
+             * @type {PaymentInfo}
+             */
+            const paymentInfo = await QuickExchangeExternal.getPrices({ pay, receive }, amount, this.admissionAddress)
+            const { result, reason } = await QuickExchangeExternal.validateExchangeRequest(
+                paymentInfo,
+                this.admissionAddress,
+            )
+            if (!result) {
+                throw mkErr.notHttpErr(`Unable to proceed the ${this.id} exchange request. Reason: ${reason}`)
+            }
+            // === Calculate needed held balance on service wallet ===
+            const prevHold = sum(toPay, pay === 'USDT' ? '0' : out).toString()
+            const newHold = sum(paymentInfo.toPay, pay === 'USDT' ? '0' : paymentInfo.fees.out).toString()
+            const holdDiff = sub(newHold, prevHold).toString()
+            // ======
+            return createPayTransaction({
+                currency: pay,
+                amount: paymentInfo.toPay,
+                fee: paymentInfo.fees.out,
+                dst: this.admissionAddress,
+                holdDiff,
+            })
+        },
+
+        /**
+         * @description Creates an reversed order at the Binance
+         * @this QuickExchangeRequest
+         * @return {Promise&lt;void>}
+         */
+        async makeReverseOrderAtBinance() {
+            Logger.log(
+                'debug',
+                `Making reverse order on the Binance due to the request: ${this.id}`,
+                'QuickExchangeExternal::makeReverseOrderAtBinance',
+            )
+            const binance = new BinanceService()
+            const {
+                paymentInfo: {
+                    currencies: { receive, pay },
+                    toPay,
+                },
+            } = this
+            return binance.createAndSendOrders(
+                {
+                    side: 'SELL',
+                    type: 'LIMIT',
+                    timeInForce: 'GTC',
+                    quantity: +toPay,
+                },
+                {
+                    base: pay,
+                    quote: receive,
+                },
+            )
+        },
+
+        /**
+         * @description Tries to fulfill the request
+         * @this QuickExchangeRequest
+         * @param {string} amount
+         * @param {*} dbTrx - The database transaction
+         * @return {Promise&lt;void>}
+         */
+        async fillRequest(amount, dbTrx) {
+            const ctx = `QuickExchangeExternal::fillRequest::${this.id}`
+            Logger.log('debug', `Filling the request: ${this.id}`, ctx)
+            // === Pay to the user part ===
+            let outTx
+            try {
+                outTx = await this.payToUser(amount, dbTrx)
+            } catch (error) {
+                Logger.log(
+                    'error',
+                    `Unable to pay to the user for Quick Exchange External. ${JSON.stringify(error.stack)}`,
+                    ctx,
+                )
+                await QuickExchangeExternal.update({ id: this.id }, { status: 'Failed', failReason: error.stack })
+            }
+            Logger.log('debug', `OutTx: ${JSON.stringify(outTx)}`, ctx)
+            // ======
+            // if (!outTx) {
+            //     return
+            // }
+            // ======
+            // === Transfer money from a generated wallet to the service wallet ===
+            // try {
+            //     await this.transferToServiceWallet(dbTrx)
+            //     await QuickExchangeExternal.update({ id: this.id }, { status: 'Closed' })
+            // } catch (error) {
+            //     Logger.log(
+            //         'error',
+            //         `Unable to transfer from generated wallet to a service wallet. ${JSON.stringify(error.stack)}`,
+            //         ctx,
+            //     )
+            //     await QuickExchangeExternal.update({ id: this.id }, { status: 'Success' })
+            // }
+            // ======
+            // === Reverse order at Binance ===
+            // try {
+            //     await this.makeReverseOrderAtBinance()
+            // } catch (error) {
+            //     Logger.log('error', `Unable to make a reverse order at Binance. ${JSON.stringify(error.stack)}`, ctx)
+            // }
+            // ======
+        },
+    },
+
+    /**
+     * @description Checks for available payed currency service balance and etc.
+     * @param {PaymentInfo} paymentInfo
+     * @param {*} dbTrx - The database transaction
+     * @param {string} [userId]
+     * @return {Promise&lt;{ result: boolean, serviceWallet?: Object, serviceWalletEth?: Object, availableAmount?: string, reason?: string }>}
+     */
+    async validateExchangeRequest(paymentInfo, dbTrx, userId) {
+        // TODO validate delta of rate and fees for payment info
+        const {
+            balance,
+            toPay,
+            currencies: { pay, receive },
+            fees: { in: feeIn },
+        } = paymentInfo
+        // === Too small amount toReceive
+        if (eq(toPay, '0')) {
+            return {
+                result: false,
+                reason: 'commission is greater than exchange amount',
+            }
+        }
+        // ======
+        // === The service wallet doesn't have enough funds
+        if (!balance) {
+            return {
+                result: false,
+                reason: 'not enough funds to complete the operation',
+                availableAmount: paymentInfo.availableAmount,
+            }
+        }
+        // ======
+        // === Check for exchange limits ===
+        const toPayInEurRate = await QuickExchange.getBinanceRate(pay, 'EUR')
+        if (!userId) {
+            if (gt(mul(toPayInEurRate, toPay), EXCHANGE_LIMIT_EUR)) {
+                const availableAmount = div(EXCHANGE_LIMIT_EUR, toPayInEurRate).toString()
+                return {
+                    result: false,
+                    reason: 'amount to pay to an user is greater than exchange limit',
+                    availableAmount,
+                }
+            }
+        }
+        // ======
+        // === Check if a service wallet exists ===
+        const serviceWallet = await Wallet.findOne({
+            owner: EXCHANGE_SERVICE_USERID,
+            crypto_currency: pay.toUpperCase(),
+        })
+        if (!serviceWallet) {
+            return { result: false, reason: `no service wallet for ${pay.toUpperCase()} currency` }
+        }
+        // ======
+        // === USDT special extra checks ===
+        if (receive === 'USDT') {
+            const serviceWalletEth = await Wallet.findOne({ owner: EXCHANGE_SERVICE_USERID, crypto_currency: 'ETH' })
+            if (!serviceWalletEth) {
+                return { result: false, reason: 'no service wallet for ETH currency' }
+            }
+            const ethBalance = await Wallet.getAvailableBalance(serviceWalletEth, dbTrx)
+            if (lt(ethBalance, mul(feeIn, 2).toString())) {
+                return { result: false, reason: 'not enough ETH to provide fee for USDT transfer' }
+            }
+            return { result: true, serviceWallet, serviceWalletEth }
+        }
+        // ======
+        return { result: true, serviceWallet }
+    },
+
+    /**
+     * @description Creates an registered user exchange wallet
+     * @param {string} userId
+     * @param {string} currency
+     * @param {string} walletName
+     * @param {*} dbTrx - Database query transaction
+     * @return {Promise&lt;Wallet>}
+     */
+    async createWalletRegistered(userId, currency, walletName, dbTrx) {
+        let exchangeWallet = await Wallet.getQuickExchangeWallet(userId, currency)
+        if (!exchangeWallet) {
+            exchangeWallet = await Wallet.createWallet(
+                {
+                    user_id: userId,
+                    name: walletName,
+                    type: 'service_externalExchange',
+                },
+                currency,
+                dbTrx,
+            )
+        } else {
+            const existedRequest = await QuickExchangeExternal.findOne({
+                generatedWalletId: exchangeWallet.id,
+                status: 'Awaiting',
+            })
+            if (existedRequest) {
+                throw mkErr.badRequest(`User has active exchange request: ${existedRequest.requestId}`)
+            }
+        }
+        return exchangeWallet
+    },
+
+    /**
+     * @description Returns the whole price data
+     * @param {{ receive: string, pay: string }} currencies
+     * @param {string} amount - Amount to receive from the user
+     * @param {string} creditWallet - which wallet will be credited to, may contain a 'new', uuid from db, address from bc
+     * @param {EstimateFixedParams} [fixedParams] - some params that should be fixed at estimating
+     * @return {Promise&lt;PaymentInfo &amp; { balance: boolean, availableAmount: string }>}
+     */
+    async getPrices(currencies, amount, creditWallet, fixedParams) {
+        const receive = currencies.receive.toUpperCase()
+        const pay = currencies.pay.toUpperCase()
+        let walletForReceiving = await Wallet.findOne({
+            owner: EXCHANGE_SERVICE_USERID,
+            crypto_currency: receive.toUpperCase(),
+        }).populate('crypto_currency')
+        if (!walletForReceiving) {
+            throw mkErr.notFound(`No service wallet for the ${receive.toUpperCase()} currency`)
+        }
+        const currencyToPay = await Crypto_currency.findOne({ id: pay.toUpperCase() })
+        const paramsForEstimated = {
+            userWallet: walletForReceiving,
+            receivedCurrency: currencyToPay,
+            outgoingAmount: amount,
+            creditWallet,
+        }
+        let {
+            costs: {
+                balance,
+                availableAmount,
+                profit,
+                rate,
+                feeOutgoing,
+                feeIncoming,
+                feeOutgoingConvert,
+                feeIncomingConvert,
+            },
+            income: { totalEstimatedIncome },
+        } = await QuickExchange.estimatedCost(
+            paramsForEstimated,
+            fixedParams &amp;&amp; {
+                feeIncoming: fixedParams.feeOut,
+                feeOutgoing: fixedParams.feeIn,
+            },
+        )
+        // === Calculating exactly toPay amount ===
+        let toPay = totalEstimatedIncome.toString()
+        if (receive === 'USDT') {
+            // ---------------------------
+            // | ⬇️ USDT receive case ⬇️ |
+            // ---------------------------
+            // user -> USDT generated wallet. Service ETH wallet -> generated USDT wallet -> service USDT wallet
+            const toChange = await RatesService.convertRate('ETH', pay, mul(feeOutgoing, 2).toString())
+            feeIncomingConvert = await Crypto_currency.trimByDecimal(
+                sum(feeIncomingConvert, toChange).toString(),
+                currencyToPay,
+            )
+            toPay = await Crypto_currency.trimByDecimal(
+                sub(totalEstimatedIncome.toString(), toChange).toString(),
+                currencyToPay,
+            )
+        }
+        if (lte(toPay, '0')) {
+            feeIncoming = '0'
+            feeOutgoingConvert = '0'
+            feeIncomingConvert = '0'
+            toPay = '0'
+        }
+        // ======
+        return {
+            balance,
+            availableAmount,
+            currencies: { receive: receive.toUpperCase(), pay: pay.toUpperCase() },
+            toReceive: amount,
+            toPay,
+            profit,
+            rate,
+            fees: {
+                out: feeIncoming, // The context of QuickExchange based on the user side
+                in: feeOutgoing,
+                convertedOut: feeOutgoingConvert,
+                convertedIn: feeIncomingConvert,
+            },
+        }
+    },
+
+    /**
+     * @description Returns the request opened for specified wallet id
+     * @param {string} walletId
+     * @return {Promise&lt;QuickExchangeRequest>}
+     */
+    async getActiveExchangeByWalletId(walletId) {
+        const minBeginDateForActiveRequests = new Date()
+        minBeginDateForActiveRequests.setHours(
+            minBeginDateForActiveRequests.getHours() -
+                parsingHours +
+                minBeginDateForActiveRequests.getTimezoneOffset() / 60,
+        )
+        return QuickExchangeExternal.findOne({
+            where: {
+                generatedWalletId: walletId,
+                status: 'Awaiting',
+                beginHandleTime: { '>=': minBeginDateForActiveRequests },
+            },
+            sort: 'createdAt asc',
+        })
+    },
+
+    /**
+     * @description Creates a new CWE user and service wallet for the user
+     * @param {ExchangeInput} exchangeData
+     * @param {*} dbTrx - Database transaction
+     * @param {string?} userId
+     * @return {Promise&lt;{
+     *     requestId: string,
+     *     userType: 'REGISTERED' | 'UNREGISTERED',
+     *     addressForUserToPay: string,
+     *     paymentInfo: PaymentInfo
+     * }>}
+     */
+    async createExchange(exchangeData, dbTrx, userId) {
+        const ctx = 'QuickExchangeExternal::createExchange'
+        const { admissionAddress, paymentInfo: receivedPaymentInfo } = exchangeData
+        const {
+            currencies: { pay, receive },
+            fees: { in: feeIn, out: feeOut },
+        } = receivedPaymentInfo
+        // TODO more clever payment checks
+        const paymentInfo = await this.getPrices(
+            receivedPaymentInfo.currencies,
+            receivedPaymentInfo.toReceive,
+            admissionAddress,
+            { feeIn, feeOut },
+        )
+        // === Validate exchange request ===
+        const { result, reason, serviceWallet, serviceWalletEth } = await this.validateExchangeRequest(
+            paymentInfo,
+            dbTrx,
+            userId,
+        )
+        if (!result) {
+            Logger.log(
+                'debug',
+                `The exchange violate validation rules. Reason: ${reason}. Input: ${JSON.stringify(exchangeData)}.`,
+                ctx,
+            )
+            throw mkErr.badRequest(`The exchange request didn't pass the validation. Reason: ${reason}.`)
+        }
+        // ======
+        // === Create the user exchange wallet
+        const walletName = `${receive} service wallet`
+        let exchangeWallet, userType, addressToReceive
+        if (userId) {
+            exchangeWallet = await this.createWalletRegistered(userId, receive, walletName, dbTrx)
+            // Proceed address as it used for simple wallet
+            addressToReceive = await Wallet.getRealAddress({ wallet: exchangeWallet })
+            userType = 'REGISTERED'
+        } else {
+            exchangeWallet = await QuickExchangeWallet.createWallet(
+                {
+                    name: walletName,
+                },
+                receive,
+                dbTrx,
+            )
+            // This information contains on the wallet entry
+            addressToReceive = exchangeWallet.address
+            userType = 'UNREGISTERED'
+        }
+        Logger.log('debug', exchangeWallet, 'QuickExchangeExternal::createExchange')
+        // ======
+        // === Save &amp; return the created exchange ===
+        const newExchange = {
+            requestId: generateRequestId(),
+            userType,
+            generatedWalletId: exchangeWallet.id,
+            admissionAddress,
+            paymentInfo: JSON.stringify(paymentInfo),
+            beginHandleTime: toDatabaseDateString(new Date()),
+        }
+        if (userId) {
+            newExchange.userId = userId
+        }
+        Logger.log('debug', newExchange, 'QuickExchangeExternal::createExchange')
+        await KnexService(this.tableName)
+            .insert(newExchange)
+            .transacting(dbTrx)
+        // === Hold balance on the service wallet ===
+        const feeToHold = pay === 'USDT' ? '0' : paymentInfo.fees.out
+        await updateServiceBalance(
+            serviceWallet.id,
+            { held_balance: `+${sum(paymentInfo.toPay, feeToHold).toString()}` },
+            dbTrx,
+        )
+        if (receive === 'USDT') {
+            // Also hold balance on ETH service wallet for fee payment
+            await updateServiceBalance(
+                serviceWalletEth.id,
+                { held_balance: `+${mul(paymentInfo.fees.in, 2).toString()}` },
+                dbTrx,
+            )
+        }
+        // ======
+        return {
+            requestId: newExchange.requestId,
+            userType,
+            addressForUserToPay: addressToReceive,
+            paymentInfo,
+        }
+        // ======
+    },
+
+    /**
+     * @description Sets the beginHandleTime to current UTC time(GMT +0)
+     * @param {number} id The ID of quick exchange external request
+     * @return {Promise&lt;void>}
+     */
+    async updateParsingTime(id) {
+        const newDate = new Date()
+        newDate.setMinutes(newDate.getMinutes() + newDate.getTimezoneOffset())
+        return QuickExchangeExternal.update({ id }, { beginHandleTime: newDate })
+    },
+
+    /**
+     * @description Free locked money on service wallet if parsing time expires or exchange failed
+     * @return {Promise&lt;void>}
+     */
+    async proceedExpiredRequests() {
+        const latestExpiredTime = new Date()
+        latestExpiredTime.setHours(
+            latestExpiredTime.getHours() - parsingHours + latestExpiredTime.getTimezoneOffset() / 60,
+        )
+        /**
+         * @type {QuickExchangeRequest[]}
+         */
+        const expiredRequests = await QuickExchangeExternal.find({
+            or: [
+                {
+                    status: 'Awaiting',
+                    beginHandleTime: { '&lt;': latestExpiredTime },
+                },
+                {
+                    status: 'Failed',
+                },
+            ],
+        })
+        for (const expiredRequest of expiredRequests) {
+            const {
+                receiveTx,
+                paymentInfo: {
+                    toPay,
+                    fees: { out, in: feeIn },
+                    currencies: { pay, receive },
+                },
+            } = expiredRequest
+            if (!receiveTx) {
+                const toFree = sum(toPay, pay === 'USDT' ? '0' : out).toString()
+                const serviceWallet = await Wallet.findOne({
+                    owner: EXCHANGE_SERVICE_USERID,
+                    crypto_currency: pay,
+                })
+                await serviceWallet.updateBalances({ held_balance: `-${toFree}` })
+                if (receive === 'USDT') {
+                    const serviceWalletEth = await Wallet.findOne({
+                        owner: EXCHANGE_SERVICE_USERID,
+                        crypto_currency: 'ETH',
+                    })
+                    await serviceWalletEth.updateBalances({ held_balance: `-${mul(feeIn, 2).toString()}` })
+                }
+            }
+            await QuickExchangeExternal.update({ id: expiredRequest.id }, { status: 'Expired' })
+        }
+    },
+
+    /**
+     * @description Fill requests that marks as payed by user, but not payed by us
+     * @return {Promise&lt;void>}
+     */
+    async proceedPayedRequests() {
+        /**
+         * @type {Array&lt;QuickExchangeRequest>}
+         */
+        const payedRequests = await QuickExchangeExternal.find({ status: 'Received' })
+        for (const request of payedRequests) {
+            await KnexService.transaction(async dbTrx => {
+                const tx = await Transaction.findOne({ id: request.receiveTx.id || request.receiveTx })
+                return request.fillRequest(tx.amount, dbTrx)
+            })
+        }
+    },
+
+    /**
+     * @description Finds new incoming transactions for external quick exchange purposes and confirms them
+     * @return {Promise&lt;void>}
+     */
+    async proceedIncomingTransactions() {
+        const confirmIncomingTransaction = async tx => {
+            const ctx = 'QuickExchangeExternal::confirmIncomingTransaction'
+            return KnexService.transaction(async dbTrx => {
+                /**
+                 * @type {QuickExchangeRequest}
+                 */
+                const exchangeRequest = await this.getActiveExchangeByWalletId(tx.dst)
+                if (!exchangeRequest) {
+                    await KnexService('transaction')
+                        .update({
+                            additional_data: JSON.stringify({
+                                whoIsSending: 'user',
+                                relatedModelId: 'none',
+                                relatedModelName: 'quickExchangeExternal',
+                            }),
+                        })
+                        .where({ id: tx.id })
+                        .transacting(dbTrx)
+                    return
+                }
+                const exchangeableCurrency = exchangeRequest.paymentInfo.currencies.receive
+                if (exchangeableCurrency === 'USDT' &amp;&amp; tx.currency_id === 'ETH') {
+                    // Ignore transaction with ETH commission for transfer between USDT service wallets
+                    return
+                }
+                await KnexService('transaction')
+                    .update({
+                        additional_data: JSON.stringify({
+                            whoIsSending: 'user',
+                            relatedModelId: exchangeRequest.id,
+                            relatedModelName: 'quickExchangeExternal',
+                        }),
+                    })
+                    .where({ id: tx.id })
+                    .transacting(dbTrx)
+                Logger.log('debug', `Confirm exchange request with ID: ${exchangeRequest.id} by tx ID: ${tx.id}`, ctx)
+                await KnexService(this.tableName)
+                    .update({ status: 'Received', receiveTxId: tx.id })
+                    .where({ id: exchangeRequest.id })
+                    .transacting(dbTrx)
+            })
+        }
+
+        const registeredExchangeWalletIds = await KnexService('wallet')
+            .select('id')
+            .where({ type: 'service_externalExchange' })
+        const unregisteredExchangeWalletIds = await KnexService('quickExchangeWallet').select('id')
+        const allWalletIds = [...registeredExchangeWalletIds, ...unregisteredExchangeWalletIds]
+        const receivedTransactionCase = {
+            dst: allWalletIds.map(entity => entity.id),
+            additional_data: null,
+        }
+        const receivedTransactions = await Transaction.find({ where: receivedTransactionCase, sort: 'createdAt asc' })
+        for (const tx of receivedTransactions) {
+            await confirmIncomingTransaction(tx)
+        }
+    },
+
+    /**
+     * @description Creates the new job that checks for an expired exchange requests
+     * @param {number} loopTime
+     * @return {Promise&lt;void>}
+     */
+    async runExpiredRequestChecker(loopTime) {
+        JobsService.make({ waitTime: loopTime, fn: this.proceedExpiredRequests.bind(this) }).start()
+    },
+
+    /**
+     * @description Creates the new job that checks for an payed exchange requests
+     * @param {number} loopTime
+     * @return {Promise&lt;void>}
+     */
+    async runPayedRequestsChecker(loopTime) {
+        JobsService.make({ waitTime: loopTime, fn: this.proceedPayedRequests.bind(this) }).start()
+    },
+
+    /**
+     * @description Creates the new job that checks new incoming transactions &amp; applies them
+     * @param {number} loopTime
+     * @return {Promise&lt;void>}
+     */
+    async runProceedIncomingTransactions(loopTime) {
+        JobsService.make({ waitTime: loopTime, fn: this.proceedIncomingTransactions.bind(this) }).start()
+    },
+
+    /**
+     * @description Returns addresses for the specified wallet IDs
+     * @param {Set&lt;string> | string[]} walletIds
+     * @return {Promise&lt;Object&lt;string, string>>}
+     */
+    async getWalletAddresses(walletIds) {
+        /**
+         * @type {Set&lt;string>}
+         */
+        let ids = walletIds
+        if (!(walletIds instanceof Set)) {
+            ids = new Set(walletIds)
+        }
+
+        const getAddress = async id => {
+            const wallet = (await Wallet.findOne({ id })) || (await QuickExchangeWallet.findOne({ id }))
+            return Wallet.getRealAddress({ wallet })
+        }
+        /**
+         * @type {Object&lt;string, string>}
+         */
+        const addresses = {}
+        const promises = []
+        for (const walletId of ids) {
+            promises.push(
+                getAddress(walletId).then(address => {
+                    addresses[walletId] = address
+                }),
+            )
+        }
+        await Promise.all(promises)
+        return addresses
+    },
+
+    /**
+     * @description Returns all requests for the specified user ID
+     * @param {SearchCase} searchCase
+     * @param {PaginationParams} paginationParams
+     * @return {Promise&lt;Array&lt;QuickExchangeRequest &amp; { generatedWalletAddress: string }>>}
+     */
+    async getExchangeRequests(searchCase, paginationParams) {
+        /**
+         * @type {QuickExchangeRequest[]}
+         */
+        const { limit, page, sort } = paginationParams
+        const exchangeRequests = await QuickExchangeExternal.find({
+            where: searchCase,
+            sort: QueriesService.makeSortParams(sort, 'createdAt DESC'),
+        })
+            .populateAll()
+            .paginate(QueriesService.makePaginationParams(limit, page))
+        const uniqGeneratedWalletIds = exchangeRequests.reduce(
+            (accumulator, currentRequest) => accumulator.add(currentRequest.generatedWalletId),
+            new Set(),
+        )
+        const mapIdsToAddresses = await this.getWalletAddresses(uniqGeneratedWalletIds)
+        return exchangeRequests.map(request => ({
+            ...request,
+            generatedWalletAddress: mapIdsToAddresses[request.generatedWalletId],
+        }))
+    },
+
+    /**
+     * @description Closes the active exchange request by user call
+     * @param {string} userId
+     * @param {string} id The exchange request ID
+     * @return {Promise&lt;void>}
+     */
+    async closeByUser(userId, id) {
+        return QuickExchangeExternal.update({ id, userId, status: 'Awaiting' }, { status: 'Failed' })
+    },
+
+    /**
+     * @description Transfer crypto from user generated wallet to the common service wallet
+     * @param {QuickExchangeRequest} entity
+     * @param {*} dbTrx - Database transaction
+     * @return {Promise&lt;*>}
+     */
+    async transferToServiceWallet(entity, dbTrx) {
+        const ctx = 'QuickExchangeExternal::transferToServiceWallet'
+        Logger.log('debug', `Transferring money to the service wallet due to the request: ${entity.id}`, ctx)
+        const {
+            id,
+            requestId,
+            userType,
+            paymentInfo: {
+                currencies: { receive },
+                fees: { in: feeIn },
+            },
+            generatedWalletId,
+            receiveTx,
+        } = entity
+        Logger.log('debug', `user type: ${userType}, receive: ${receive}, entity: ${JSON.stringify(entity)}`, ctx)
+        let generatedWallet
+        let receivedTx = receiveTx
+        if (typeof receiveTx === 'number') {
+            receivedTx = await Transaction.findOne({ id: receiveTx })
+        }
+        const amount =
+            receive === 'USDT'
+                ? receivedTx.amount
+                : await Crypto_currency.trimByDecimal(sub(receivedTx.amount, feeIn).toString(), receive)
+        if (userType === 'UNREGISTERED') {
+            generatedWallet = await QuickExchangeWallet.findOne({ id: generatedWalletId })
+            if (!generatedWallet) {
+                throw mkErr.notFound(
+                    `unable to find out a wallet for quick exchange with ID: ${id}, request ID: ${requestId}`,
+                )
+            }
+            return generatedWallet.insertTxToServiceWallet({ amount, fee: feeIn, exchangeId: id }, dbTrx)
+        }
+        const serviceWallet = await Wallet.findOne({
+            owner: EXCHANGE_SERVICE_USERID,
+            crypto_currency: receive,
+        })
+        if (!serviceWallet) {
+            throw mkErr.notFound(`no service wallet for the ${receive} currency`)
+        }
+        generatedWallet = await Wallet.findOne({ id: generatedWalletId })
+        const txInput = {
+            amount,
+            fee: feeIn,
+            src: generatedWalletId,
+            dst: serviceWallet.id,
+            type: 'External',
+            additional_data: { relatedModelId: id, relatedModelName: 'quickExchangeExternal', whoIsSending: 'service' },
+        }
+        const tx = await Transaction.insertOutTx(txInput, dbTrx)
+        await generatedWallet.updateBalances({ held_balance: `+${tx.getAmount()}` }, dbTrx)
+        let userId
+        try {
+            userId = generatedWallet.owner.id || generatedWallet.owner
+            await entity.notifyUser(userId, 'WalletFundsWereBlockedForQuickExchangeExternal', {
+                amount: tx.getAmount().toString(),
+                currencyId: receive,
+                modelName: 'Wallet',
+            })
+        } catch (error) {
+            Logger.log('warn', `Unable to push notification for ${userId}`, ctx)
+        }
+        return tx
+    },
+
+    /**
+     * @description Transfer ETH to the generated USDT wallet to pay commission for the next step
+     *  Service ETH wallet -> generated USDT wallet -> service USDT wallet
+     * @param {QuickExchangeRequest} entity
+     * @param {*} dbTrx
+     * @return {Promise&lt;void>}
+     */
+    async transferEthToUsdtServiceWallet(entity, dbTrx) {
+        const ctx = 'QuickExchangeExternal::transferToServiceWalletUsdt'
+        const {
+            id,
+            generatedWalletId,
+            paymentInfo: {
+                fees: { in: feeIn },
+            },
+        } = entity
+        Logger.log(
+            'debug',
+            `Transferring money to the generated USDT wallet from general ETH wallet due to the request with ID: ${id}`,
+            ctx,
+        )
+        // === Service ETH wallet -> generated USDT wallet ===
+        const serviceWalletEth = await Wallet.findOne({ owner: EXCHANGE_SERVICE_USERID, crypto_currency: 'ETH' })
+        if (!serviceWalletEth) {
+            throw mkErr.notHttpErr('Service wallet not found!')
+        }
+        const txInput = {
+            amount: feeIn,
+            fee: feeIn,
+            src: serviceWalletEth.id,
+            dst: generatedWalletId,
+            type: 'External',
+            additional_data: { relatedModelId: id, relatedModelName: 'quickExchangeExternal', whoIsSending: 'service' },
+        }
+        await Transaction.insertOutTx(txInput, dbTrx)
+        // ======
+    },
+
+    /**
+     * @description Sends transactions between service wallets
+     * @param {QuickExchangeRequest} exchangeRequest
+     * @param {*} dbTrx
+     * @return {Promise&lt;*>}
+     */
+    async proceedTransferBetweenServiceWallets(exchangeRequest, dbTrx) {
+        const ctx = 'QuickExchangeExternal::proceedTransferBetweenServiceWallets'
+        const exchangeableCurrency = exchangeRequest.paymentInfo.currencies.receive
+        try {
+            if (exchangeableCurrency === 'USDT') {
+                // To proceed transaction between USDT wallets the generated wallet should has some ETH for the commission purpose
+                await this.transferEthToUsdtServiceWallet(exchangeRequest, dbTrx)
+            } else {
+                await this.transferToServiceWallet(exchangeRequest, dbTrx)
+            }
+        } catch (error) {
+            Logger.log('error', `Unable to transfer to the service wallet. Error: ${JSON.stringify(error.stack)}`, ctx)
+            return QuickExchangeExternal.update(
+                { id: exchangeRequest.id },
+                {
+                    status: 'Payed',
+                    failReason: `Unable to transfer to the service wallet. Error: ${JSON.stringify(error.stack)}`,
+                },
+            )
+        }
+        return QuickExchangeExternal.update({ id: exchangeRequest.id }, { status: 'Closing' })
+    },
+
+    /**
+     * @description Finds and trying to proceed requests with status Payed
+     * @return {Promise&lt;void>}
+     */
+    async proceedFailedOnServiceTransferRequests() {
+        const exchangeRequests = await QuickExchangeExternal.find({ status: 'Payed', failReason: { not: null } })
+        for (const request of exchangeRequests) {
+            await KnexService.transaction(async dbTrx => {
+                return this.proceedTransferBetweenServiceWallets(request, dbTrx)
+            })
+        }
+    },
+
+    /**
+     * @description Creates the new job that repeat proceeding of requests with status Payed
+     * @param {number} loopTime
+     * @return {Promise&lt;void>}
+     */
+    async runProceedingFailedOnServiceTransfer(loopTime) {
+        JobsService.make({ waitTime: loopTime, fn: this.proceedFailedOnServiceTransferRequests.bind(this) }).start()
+    },
+
+    /**
+     * @description Proceed logic after paying to the user(transfer to the service wallet &amp; Binance order)
+     * @param {number} entityId
+     * @param {Transaction} tx
+     * @param {*} dbTrx - Database transaction
+     * @return {Promise&lt;void>}
+     */
+    async handlePayTransactionCommit(entityId, tx, dbTrx) {
+        const ctx = 'QuickExchangeExternal::handlePayTransactionCommit'
+        /**
+         * @type {QuickExchangeRequest}
+         */
+        const exchangeRequest = await QuickExchangeExternal.findOne({ id: entityId })
+        if (!exchangeRequest) {
+            return
+        }
+        if (exchangeRequest.status === 'Paying') {
+            // === Notify receiver about funds
+            try {
+                // the wallet where service payed funds
+                const receivedWallet = await Wallet.findOne({ id: tx.dst })
+                if (receivedWallet) {
+                    await exchangeRequest.notifyUser(
+                        receivedWallet.owner,
+                        'WalletFundsPayedToUserDueQuickExchangeExternal',
+                        {
+                            amount: tx.getAmount().toString(),
+                            currencyId: tx.currency_id,
+                            walletName: receivedWallet.name,
+                            modelName: 'Wallet',
+                        },
+                    )
+                }
+            } catch (error) {
+                Logger.log(
+                    'warn',
+                    `Unable to push notification about incoming incoming transaction. Error: ${JSON.stringify(
+                        error.stack,
+                    )}`,
+                    ctx,
+                )
+            }
+            // ======
+            await this.proceedTransferBetweenServiceWallets(exchangeRequest, dbTrx)
+        } else if (exchangeRequest.status === 'Closing') {
+            const exchangeableCurrency = exchangeRequest.paymentInfo.currencies.receive
+            if (exchangeableCurrency === 'USDT') {
+                if (tx.currency_id === 'ETH') {
+                    // === Handle transfer from general ETH wallet to a generated USDT wallet
+                    try {
+                        return this.transferToServiceWallet(exchangeRequest, dbTrx)
+                    } catch (error) {
+                        Logger.log(
+                            'error',
+                            `Unable to transfer to the service wallet. Error: ${JSON.stringify(error.stack)}`,
+                            ctx,
+                        )
+                        return QuickExchangeExternal.update(
+                            { id: entityId },
+                            {
+                                status: 'Payed',
+                                failReason: `Unable to transfer to the service wallet. Error: ${JSON.stringify(
+                                    error.stack,
+                                )}`,
+                            },
+                        )
+                    }
+                    // ======
+                }
+                // Otherwise its transaction between the generated USDT wallet and the general USDT wallet
+            }
+            // === If user is unregistered -> set status to the generated wallet as USED ===
+            if (exchangeRequest.userType === 'UNREGISTERED') {
+                try {
+                    await QuickExchangeWallet.update({ id: exchangeRequest.generatedWalletId }, { status: 'USED' })
+                } catch (error) {
+                    Logger.log(
+                        'error',
+                        `Unable to update status for UNREGISTERED wallet. Wallet ID: ${
+                            exchangeRequest.generatedWalletId
+                        }. Error: ${error.stack}`,
+                        ctx,
+                    )
+                }
+            }
+            // ======
+            return QuickExchangeExternal.update({ id: entityId }, { status: 'Success', failReason: null })
+        }
+    },
+
+    /**
+     * @description Proceed logic for failed transaction. Paying to an user or Closing request(transfer between service wallets)
+     * @param {number} entityId
+     * @param {string | object} reason
+     * @param {number} txId - Transaction table id field(not blockchain TxID)
+     * @return {Promise&lt;void>}
+     */
+    async handlePayTransactionFailed(entityId, reason, txId) {
+        const ctx = 'QuickExchangeExternal::handlePayTransactionFailed'
+        const exchangeRequest = await QuickExchangeExternal.findOne({ id: entityId })
+        if (!exchangeRequest) {
+            return
+        }
+        if (exchangeRequest.status === 'Closing') {
+            const message = `ID of the tx: ${txId}. Reason: ${JSON.stringify(reason)}`
+            Logger.log('error', `Unable to transfer to the general service wallet. ${message}`, ctx)
+            return QuickExchangeExternal.update(
+                { id: entityId },
+                { status: 'Payed', failReason: `Fail to transfer to the general service wallet. ${message}` },
+            )
+        } else if (exchangeRequest.status === 'Paying') {
+            const message = `ID of the tx: ${txId}. Reason: ${JSON.stringify(reason)}`
+            Logger.log('error', `Unable to pay to the user. ${message}`, ctx)
+            return QuickExchangeExternal.update(
+                { id: entityId },
+                { status: 'Failed', failReason: `Fail to pay to the user. ${message}` },
+            )
+        }
+    },
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href='index.html'>Home</a></h2><h3>Global</h3><ul><li><a href='global.html#generateRequestId'>generateRequestId</a></li><li><a href='global.html#toDatabaseDateString'>toDatabaseDateString</a></li><li><a href='global.html#updateServiceBalance'>updateServiceBalance</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.6</a> on Thu Feb 11 2021 16:17:02 GMT+0600 (+06)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src='scripts/linenumber.js'> </script>
+</body>
+</html>
